@@ -1,8 +1,9 @@
 import { configVariable, defineConfig } from "hardhat/config";
 import hardhatToolboxViem from "@nomicfoundation/hardhat-toolbox-viem";
+import hardhatVerify from "@nomicfoundation/hardhat-verify";
 
 export default defineConfig({
-  plugins: [hardhatToolboxViem],
+  plugins: [hardhatToolboxViem, hardhatVerify],
   solidity: {
     profiles: {
       default: {
@@ -48,6 +49,13 @@ export default defineConfig({
       url: configVariable("POLYGON_AMOY_RPC_URL"),
       accounts: [configVariable("POLYGON_AMOY_PRIVATE_KEY")],
       chainId: 80002,
+    },
+  },
+  verify: {
+    etherscan: {
+      // Your API key for Etherscan
+      // Obtain one at https://etherscan.io/
+      apiKey: configVariable("ETHERSCAN_API_KEY"),
     },
   },
 });

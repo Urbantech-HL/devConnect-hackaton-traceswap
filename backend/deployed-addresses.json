@@ -1,0 +1,9 @@
+{
+  "network": "polygonAmoy",
+  "timestamp": "2025-11-24T21:18:37.977Z",
+  "contracts": {
+    "TenderFactory": "0x0644ff4850ef6d0036da3815f0a146141d5af793",
+    "AuctionManager": "0x0910a26936ffeb8003125412e8e5e5864f52565c",
+    "EscrowVault": "0x733820c0ae5921b61e19e08b0b101675321791fb"
+  }
+}

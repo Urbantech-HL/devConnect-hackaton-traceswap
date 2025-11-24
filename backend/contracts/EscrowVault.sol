@@ -1,24 +1,35 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.28;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {
+    ReentrancyGuard
+} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {
+    MerkleProof
+} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 /**
  * @title EscrowVault
  * @notice Manages escrow deposits and fund releases for TraceSwap tenders
- * @dev Uses MerkleProof for admin whitelist and ReentrancyGuard for security
+ * @dev Uses AccessControl for role management, MerkleProof for admin whitelist,
+ *      and ReentrancyGuard for security. Follows KISS, DRY, SOLID principles.
  */
-contract EscrowVault is Ownable, ReentrancyGuard {
-    // Constants
+contract EscrowVault is AccessControl, ReentrancyGuard {
+    // --- Roles ---
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant FACTORY_ROLE = keccak256("FACTORY_ROLE");
+
+    // --- Constants ---
     uint256 public constant FEE_BASIS_POINTS = 20; // 0.2% fee (20/10000)
     uint256 public constant BASIS_POINTS = 10000;
 
-    // State variables
+    // --- Immutable State Variables ---
+    address public immutable tenderFactory;
+    address public immutable feeCollector;
+
+    // --- State Variables ---
     bytes32 public adminMerkleRoot;
-    address public tenderFactory;
-    address public feeCollector;
     uint256 public totalFeesCollected;
 
     // Mapping: tenderId => deposited amount
@@ -27,7 +38,7 @@ contract EscrowVault is Ownable, ReentrancyGuard {
     // Mapping: tenderId => released status
     mapping(uint256 => bool) public tenderReleased;
 
-    // Events
+    // --- Events ---
     event DepositReceived(uint256 indexed tenderId, uint256 amount);
     event FundsReleased(
         uint256 indexed tenderId,
@@ -36,63 +47,49 @@ contract EscrowVault is Ownable, ReentrancyGuard {
         uint256 fee
     );
     event FeesWithdrawn(address indexed collector, uint256 amount);
-    event AdminMerkleRootUpdated(bytes32 newRoot);
-    event FeeCollectorUpdated(address newCollector);
+    event AdminMerkleRootUpdated(bytes32 indexed newRoot);
 
-    // Custom errors
+    // --- Custom errors ---
     error NotAuthorized();
-    error NotFactory();
     error InvalidAmount();
+    error InvalidAddress();
     error AlreadyReleased();
     error NoFundsToWithdraw();
     error TransferFailed();
 
     /**
-     * @notice Constructor initializes contract with owner
+     * @notice Constructor initializes contract with immutable dependencies
+     * @param _tenderFactory Address of the TenderFactory contract
+     * @param _feeCollector Address that collects platform fees
      */
-    constructor() Ownable(msg.sender) {
-        feeCollector = msg.sender;
-    }
+    constructor(address _tenderFactory, address _feeCollector) {
+        if (_tenderFactory == address(0) || _feeCollector == address(0)) {
+            revert InvalidAddress();
+        }
 
-    /**
-     * @notice Modifier to restrict access to tender factory only
-     */
-    modifier onlyFactory() {
-        if (msg.sender != tenderFactory) revert NotFactory();
-        _;
-    }
+        tenderFactory = _tenderFactory;
+        feeCollector = _feeCollector;
 
-    /**
-     * @notice Set the tender factory address
-     * @param _factory Address of the TenderFactory contract
-     */
-    function setTenderFactory(address _factory) external onlyOwner {
-        tenderFactory = _factory;
+        // Grant roles to deployer
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(FACTORY_ROLE, _tenderFactory);
     }
 
     /**
      * @notice Set the admin merkle root for authorization
      * @param _root New merkle root
      */
-    function setAdminMerkleRoot(bytes32 _root) external onlyOwner {
+    function setAdminMerkleRoot(bytes32 _root) external onlyRole(ADMIN_ROLE) {
         adminMerkleRoot = _root;
         emit AdminMerkleRootUpdated(_root);
-    }
-
-    /**
-     * @notice Set the fee collector address
-     * @param _collector Address that collects platform fees
-     */
-    function setFeeCollector(address _collector) external onlyOwner {
-        feeCollector = _collector;
-        emit FeeCollectorUpdated(_collector);
     }
 
     /**
      * @notice Deposit funds for a tender (called by TenderFactory)
      * @param tenderId ID of the tender
      */
-    function deposit(uint256 tenderId) external payable onlyFactory {
+    function deposit(uint256 tenderId) external payable onlyRole(FACTORY_ROLE) {
         if (msg.value == 0) revert InvalidAmount();
 
         tenderDeposits[tenderId] += msg.value;
@@ -111,8 +108,7 @@ contract EscrowVault is Ownable, ReentrancyGuard {
         bytes32[] calldata proof
     ) external nonReentrant {
         // Verify admin authorization
-        bytes32 leaf = keccak256(abi.encodePacked(msg.sender));
-        if (!MerkleProof.verify(proof, adminMerkleRoot, leaf)) {
+        if (!_verifyWhitelist(msg.sender, proof)) {
             revert NotAuthorized();
         }
 
@@ -122,7 +118,7 @@ contract EscrowVault is Ownable, ReentrancyGuard {
         uint256 depositAmount = tenderDeposits[tenderId];
         if (depositAmount == 0) revert InvalidAmount();
 
-        // Mark as released
+        // Mark as released (Checks-Effects-Interactions pattern)
         tenderReleased[tenderId] = true;
 
         // Calculate fee and payment
@@ -133,27 +129,26 @@ contract EscrowVault is Ownable, ReentrancyGuard {
         totalFeesCollected += fee;
 
         // Transfer funds to recipient
-        (bool success, ) = recipient.call{value: payment}("");
-        if (!success) revert TransferFailed();
+        _safeTransfer(recipient, payment);
 
         emit FundsReleased(tenderId, recipient, payment, fee);
     }
 
     /**
-     * @notice Withdraw collected fees (only fee collector)
+     * @notice Withdraw collected fees (only fee collector or admin)
      */
     function withdrawFees() external nonReentrant {
-        if (msg.sender != feeCollector && msg.sender != owner()) {
+        if (!hasRole(ADMIN_ROLE, msg.sender) && msg.sender != feeCollector) {
             revert NotAuthorized();
         }
 
         uint256 feesToWithdraw = totalFeesCollected;
         if (feesToWithdraw == 0) revert NoFundsToWithdraw();
 
+        // Reset fees before transfer (Checks-Effects-Interactions pattern)
         totalFeesCollected = 0;
 
-        (bool success, ) = feeCollector.call{value: feesToWithdraw}("");
-        if (!success) revert TransferFailed();
+        _safeTransfer(feeCollector, feesToWithdraw);
 
         emit FeesWithdrawn(feeCollector, feesToWithdraw);
     }
@@ -174,6 +169,30 @@ contract EscrowVault is Ownable, ReentrancyGuard {
      */
     function isReleased(uint256 tenderId) external view returns (bool) {
         return tenderReleased[tenderId];
+    }
+
+    /**
+     * @notice Internal function to safely transfer ETH
+     * @param to Recipient address
+     * @param amount Amount to transfer
+     */
+    function _safeTransfer(address to, uint256 amount) private {
+        (bool success, ) = to.call{value: amount}("");
+        if (!success) revert TransferFailed();
+    }
+
+    /**
+     * @notice Verifies if an address is whitelisted using Merkle proof
+     * @param account The address to verify
+     * @param proof The Merkle proof
+     * @return bool True if the address is whitelisted
+     */
+    function _verifyWhitelist(
+        address account,
+        bytes32[] calldata proof
+    ) private view returns (bool) {
+        bytes32 leaf = keccak256(abi.encodePacked(account));
+        return MerkleProof.verify(proof, adminMerkleRoot, leaf);
     }
 
     /**

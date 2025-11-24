@@ -1,14 +1,36 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.28;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
-import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {
+    AutomationCompatibleInterface
+} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
+import {
+    MerkleProof
+} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
-contract AuctionManager is Ownable, AutomationCompatibleInterface {
-    // State variables
+/**
+ * @title AuctionManager
+ * @notice Manages the bidding process for Tenders and handles automatic closure via Chainlink Automation.
+ * @dev Implements Chainlink AutomationCompatibleInterface for `checkUpkeep` and `performUpkeep`.
+ *      Uses AccessControl for role-based permissions and follows KISS, DRY, SOLID principles.
+ */
+contract AuctionManager is AccessControl, AutomationCompatibleInterface {
+    // --- Roles ---
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant FACTORY_ROLE = keccak256("FACTORY_ROLE");
+
+    // --- Errors ---
+    error AuctionAlreadyClosed();
+    error AuctionEnded();
+    error UnauthorizedSupplier(address supplier);
+    error InvalidTenderId();
+
+    // --- Immutable State Variables ---
+    address public immutable tenderFactory;
+
+    // --- State Variables ---
     bytes32 public supplierMerkleRoot;
-    address public tenderFactory;
 
     struct Bid {
         uint256 amount;
@@ -30,7 +52,7 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
     mapping(uint256 => Auction) public auctions;
     uint256[] public activeTenders;
 
-    // Events
+    // --- Events ---
     event BidSubmitted(
         uint256 indexed tenderId,
         address indexed supplier,
@@ -42,22 +64,33 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
         address winner,
         uint256 amount
     );
+    event SupplierMerkleRootUpdated(bytes32 indexed newRoot);
 
-    constructor() Ownable(msg.sender) {}
+    /**
+     * @notice Constructor initializes the contract with immutable tenderFactory
+     * @param _tenderFactory Address of the TenderFactory contract
+     */
+    constructor(address _tenderFactory) {
+        if (_tenderFactory == address(0)) revert InvalidTenderId();
 
-    modifier onlyFactory() {
-        require(msg.sender == tenderFactory, "Only factory");
-        _;
+        tenderFactory = _tenderFactory;
+
+        // Grant roles to deployer
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(FACTORY_ROLE, _tenderFactory);
     }
 
-    function setTenderFactory(address _factory) external onlyOwner {
-        tenderFactory = _factory;
-    }
-
+    /**
+     * @notice Starts an auction for a specific tender.
+     * @dev Called only by TenderFactory.
+     * @param tenderId The ID of the tender.
+     * @param deadline The timestamp when the auction ends.
+     */
     function startAuction(
         uint256 tenderId,
         uint256 deadline
-    ) external onlyFactory {
+    ) external onlyRole(FACTORY_ROLE) {
         auctions[tenderId] = Auction({
             deadline: deadline,
             closed: false,
@@ -70,6 +103,13 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
         emit AuctionStarted(tenderId, deadline);
     }
 
+    /**
+     * @notice Submits a bid for a tender.
+     * @param tenderId The ID of the tender.
+     * @param amount The bid amount (price).
+     * @param certsUri IPFS URI for certifications.
+     * @param proof Merkle proof for supplier whitelist.
+     */
     function submitBid(
         uint256 tenderId,
         uint256 amount,
@@ -77,15 +117,13 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
         bytes32[] calldata proof
     ) external {
         Auction storage auction = auctions[tenderId];
-        require(!auction.closed, "Auction closed");
-        require(block.timestamp < auction.deadline, "Auction ended");
+        if (auction.closed) revert AuctionAlreadyClosed();
+        if (block.timestamp >= auction.deadline) revert AuctionEnded();
 
         // Verify whitelist
-        bytes32 leaf = keccak256(abi.encodePacked(msg.sender));
-        require(
-            MerkleProof.verify(proof, supplierMerkleRoot, leaf),
-            "Not authorized supplier"
-        );
+        if (!_verifyWhitelist(msg.sender, proof)) {
+            revert UnauthorizedSupplier(msg.sender);
+        }
 
         tenderBids[tenderId].push(
             Bid({
@@ -105,6 +143,11 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
         emit BidSubmitted(tenderId, msg.sender, amount);
     }
 
+    /**
+     * @notice Checks if any auctions need to be closed.
+     * @return upkeepNeeded True if there are auctions to close.
+     * @return performData Encoded array of tenderIds to close.
+     */
     function checkUpkeep(
         bytes calldata /* checkData */
     )
@@ -116,22 +159,31 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
         uint256[] memory tendersToClose = new uint256[](activeTenders.length);
         uint256 count = 0;
 
-        for (uint256 i = 0; i < activeTenders.length; i++) {
+        uint256 length = activeTenders.length;
+        for (uint256 i = 0; i < length; ) {
             uint256 tenderId = activeTenders[i];
-            if (
-                block.timestamp > auctions[tenderId].deadline &&
-                !auctions[tenderId].closed
-            ) {
+            Auction storage auction = auctions[tenderId];
+
+            if (block.timestamp > auction.deadline && !auction.closed) {
                 tendersToClose[count] = tenderId;
-                count++;
+                unchecked {
+                    ++count;
+                }
+            }
+
+            unchecked {
+                ++i;
             }
         }
 
         if (count > 0) {
             // Resize array
             uint256[] memory result = new uint256[](count);
-            for (uint256 i = 0; i < count; i++) {
+            for (uint256 i = 0; i < count; ) {
                 result[i] = tendersToClose[i];
+                unchecked {
+                    ++i;
+                }
             }
             return (true, abi.encode(result));
         }
@@ -139,39 +191,85 @@ contract AuctionManager is Ownable, AutomationCompatibleInterface {
         return (false, "");
     }
 
+    /**
+     * @notice Closes auctions that have passed their deadline.
+     * @param performData Encoded array of tenderIds to close.
+     */
     function performUpkeep(bytes calldata performData) external override {
         uint256[] memory tendersToClose = abi.decode(performData, (uint256[]));
 
-        for (uint256 i = 0; i < tendersToClose.length; i++) {
-            uint256 tenderId = tendersToClose[i];
-            Auction storage auction = auctions[tenderId];
-
-            if (block.timestamp > auction.deadline && !auction.closed) {
-                auction.closed = true;
-                auction.winner = auction.bestBidder;
-                auction.winningBidAmount = auction.bestBidAmount;
-
-                // Remove from activeTenders (swap and pop)
-                for (uint256 j = 0; j < activeTenders.length; j++) {
-                    if (activeTenders[j] == tenderId) {
-                        activeTenders[j] = activeTenders[
-                            activeTenders.length - 1
-                        ];
-                        activeTenders.pop();
-                        break;
-                    }
-                }
-
-                emit AuctionClosed(
-                    tenderId,
-                    auction.winner,
-                    auction.winningBidAmount
-                );
+        uint256 length = tendersToClose.length;
+        for (uint256 i = 0; i < length; ) {
+            _closeAuction(tendersToClose[i]);
+            unchecked {
+                ++i;
             }
         }
     }
 
-    function setSupplierMerkleRoot(bytes32 _root) external onlyOwner {
+    /**
+     * @notice Sets the Merkle Root for supplier whitelist.
+     * @param _root The new Merkle Root.
+     */
+    function setSupplierMerkleRoot(
+        bytes32 _root
+    ) external onlyRole(ADMIN_ROLE) {
         supplierMerkleRoot = _root;
+        emit SupplierMerkleRootUpdated(_root);
+    }
+
+    /**
+     * @notice Internal function to close a single auction
+     * @param tenderId The ID of the tender to close
+     */
+    function _closeAuction(uint256 tenderId) private {
+        Auction storage auction = auctions[tenderId];
+
+        if (block.timestamp > auction.deadline && !auction.closed) {
+            auction.closed = true;
+            auction.winner = auction.bestBidder;
+            auction.winningBidAmount = auction.bestBidAmount;
+
+            // Remove from activeTenders (swap and pop)
+            _removeActiveTender(tenderId);
+
+            emit AuctionClosed(
+                tenderId,
+                auction.winner,
+                auction.winningBidAmount
+            );
+        }
+    }
+
+    /**
+     * @notice Internal function to remove a tender from activeTenders array
+     * @param tenderId The ID of the tender to remove
+     */
+    function _removeActiveTender(uint256 tenderId) private {
+        uint256 length = activeTenders.length;
+        for (uint256 j = 0; j < length; ) {
+            if (activeTenders[j] == tenderId) {
+                activeTenders[j] = activeTenders[length - 1];
+                activeTenders.pop();
+                break;
+            }
+            unchecked {
+                ++j;
+            }
+        }
+    }
+
+    /**
+     * @notice Verifies if an address is whitelisted using Merkle proof
+     * @param account The address to verify
+     * @param proof The Merkle proof
+     * @return bool True if the address is whitelisted
+     */
+    function _verifyWhitelist(
+        address account,
+        bytes32[] calldata proof
+    ) private view returns (bool) {
+        bytes32 leaf = keccak256(abi.encodePacked(account));
+        return MerkleProof.verify(proof, supplierMerkleRoot, leaf);
     }
 }
